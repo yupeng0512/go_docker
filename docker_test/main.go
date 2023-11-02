@@ -116,7 +116,11 @@ func decryptFileHandlerByPost(c *gin.Context) {
 	stream := cipher.NewCFBDecrypter(block, key)
 
 	// 创建解密后的文件
-	decryptedFile, err := os.Create("./attachment/decrypt_file/" + file.Filename)
+	filePath := "./attachment/decrypt_file/"
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		err = os.MkdirAll(filePath, os.ModePerm)
+	}
+	decryptedFile, err := os.Create(filePath + file.Filename)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -174,7 +178,11 @@ func decryptFileHandlerByGet(c *gin.Context) {
 	stream := cipher.NewCFBDecrypter(block, key)
 
 	// 创建解密后的文件
-	decryptedFile, err := os.Create("./attachment/decrypt_file/" + decryptedFileName)
+	filePath := "./attachment/decrypt_file/"
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		err = os.MkdirAll(filePath, os.ModePerm)
+	}
+	decryptedFile, err := os.Create(filePath + decryptedFileName)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -193,7 +201,23 @@ func decryptFileHandlerByGet(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	fileData, err := io.ReadAll(decryptedFile)
+
+	// 打开文件
+	file, err := os.Open(filePath + decryptedFileName)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	// 获取文件信息
+	fileInfo, err := file.Stat()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	// 创建一个缓冲区，大小为文件的长度
+	fileData := make([]byte, fileInfo.Size())
+	// 读取文件内容到缓冲区
+	_, err = file.Read(fileData)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -201,5 +225,10 @@ func decryptFileHandlerByGet(c *gin.Context) {
 
 	// 设置响应头，指定Content-Type为二进制流
 	c.Header("Content-Type", "application/octet-stream")
-	c.Data(http.StatusOK, "application/octet-stream", fileData)
+	// 将文件内容作为二进制流发送给浏览器
+	_, err = c.Writer.Write(fileData)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 }
