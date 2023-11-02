@@ -1,0 +1,3 @@
+# config.yaml
+encryption:
+  key: "123456789abcdefg"
