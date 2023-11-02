@@ -53,7 +53,7 @@ func encryptFileHandler(c *gin.Context) {
 	}(srcFile)
 
 	// 创建加密后的文件
-	encryptedFilePath := "./encrypt_file/" + fmt.Sprintf("file_%d", rand.Intn(1000000))
+	encryptedFilePath := "./attachment/encrypt_file/" + fmt.Sprintf("file_%d", rand.Intn(1000000))
 	encryptedFile, err := os.Create(encryptedFilePath)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -112,7 +112,7 @@ func decryptFileHandlerByPost(c *gin.Context) {
 	stream := cipher.NewCFBDecrypter(block, key)
 
 	// 创建解密后的文件
-	decryptedFile, err := os.Create("./decrypt_file/" + file.Filename)
+	decryptedFile, err := os.Create("./attachment/decrypt_file/" + file.Filename)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -134,7 +134,7 @@ func decryptFileHandlerByPost(c *gin.Context) {
 
 	// 设置响应头，指定Content-Type为二进制流
 	c.Header("Content-Type", "application/octet-stream")
-	c.FileAttachment("./decrypt_file/"+file.Filename, file.Filename)
+	c.File("./attachment/decrypt_file/" + file.Filename)
 }
 
 func main() {
@@ -170,7 +170,7 @@ func decryptFileHandlerByGet(c *gin.Context) {
 	stream := cipher.NewCFBDecrypter(block, key)
 
 	// 创建解密后的文件
-	decryptedFile, err := os.Create("./decrypt_file/" + decryptedFileName)
+	decryptedFile, err := os.Create("./attachment/decrypt_file/" + decryptedFileName)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
