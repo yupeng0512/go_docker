@@ -4,8 +4,10 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"fmt"
+	"github.com/gabriel-vasile/mimetype"
 	"github.com/gin-gonic/gin"
 	"github.com/h2non/filetype"
+	"github.com/h2non/filetype/types"
 	"github.com/spf13/viper"
 	"io"
 	"math/rand"
@@ -199,24 +201,19 @@ func decryptFileHandlerByGet(c *gin.Context) {
 	}
 	// 读取文件内容
 	fileData, err := io.ReadAll(file)
-	// 识别文件类型
-	kind, err := filetype.Match(fileData)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+	// 使用 mimetype 库来获取文件的 MIME 类型
+	mimeType := mimetype.Detect(fileData).String()
+	// 如果 mimetype 未能准确识别文件类型，则使用 filetype 库来进一步识别
+	if mimeType == "application/octet-stream" || mimeType == "application/x-dosexec" || mimeType == "application/zip" {
+		kind, _ := filetype.Match(fileData)
+		if kind != types.Unknown {
+			mimeType = kind.MIME.Value
+		}
 	}
-	// 如果识别到文件类型
-	if kind != filetype.Unknown {
-		// 获取 MIME 类型
-		mimeType := kind.MIME.Value
-		// 设置响应头，指定Content-Type为二进制流
-		c.Header("Content-Type", mimeType)
-		// 将文件内容作为二进制流发送给浏览器
-		c.Data(http.StatusOK, mimeType, fileData)
-	} else {
-		// 未能识别文件类型
-		c.AbortWithStatus(http.StatusInternalServerError)
-	}
+	// 设置响应头，指定Content-Type为二进制流
+	c.Header("Content-Type", mimeType)
+	// 将文件内容作为二进制流发送给浏览器
+	c.Data(http.StatusOK, mimeType, fileData)
 }
 
 func main() {
