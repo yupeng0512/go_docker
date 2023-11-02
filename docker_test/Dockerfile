@@ -10,6 +10,7 @@ COPY go.sum .
 COPY . .
 
 # 将我们的代码编译成二进制可执行文件app
+RUN go env -w GOPROXY=https://goproxy.io,direct
 RUN go build -o main .
 
 # 移动到用于存放生成的二进制文件的 /dist 目录
