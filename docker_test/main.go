@@ -53,7 +53,11 @@ func encryptFileHandler(c *gin.Context) {
 	}(srcFile)
 
 	// 创建加密后的文件
-	encryptedFilePath := "./attachment/encrypt_file/" + fmt.Sprintf("file_%d", rand.Intn(1000000))
+	filePath := "./attachment/encrypt_file/"
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		err = os.MkdirAll(filePath, os.ModePerm)
+	}
+	encryptedFilePath := filePath + fmt.Sprintf("file_%d", rand.Intn(1000000))
 	encryptedFile, err := os.Create(encryptedFilePath)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -189,7 +193,13 @@ func decryptFileHandlerByGet(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	fileData, err := io.ReadAll(decryptedFile)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 
 	// 设置响应头，指定Content-Type为二进制流
 	c.Header("Content-Type", "application/octet-stream")
+	c.Data(http.StatusOK, "application/octet-stream", fileData)
 }
