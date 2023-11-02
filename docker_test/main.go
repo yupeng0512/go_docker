@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"fmt"
 	"github.com/gin-gonic/gin"
+	"github.com/h2non/filetype"
 	"github.com/spf13/viper"
 	"io"
 	"math/rand"
@@ -145,18 +146,6 @@ func decryptFileHandlerByPost(c *gin.Context) {
 	c.File("./attachment/decrypt_file/" + file.Filename)
 }
 
-func main() {
-	loadConfig()
-	router := gin.Default()
-
-	// 设置路由
-	router.POST("/encrypt", encryptFileHandler)
-	router.POST("/post-decrypt", decryptFileHandlerByPost)
-	router.GET("/get-decrypt", decryptFileHandlerByGet)
-	// 启动服务器
-	router.Run(":8888")
-}
-
 // 传入加密后文件地址和原始文件名，解密后向浏览器输出原始格式的二进制流的路由处理函数
 func decryptFileHandlerByGet(c *gin.Context) {
 	// 从请求参数中获取加密后文件地址
@@ -208,27 +197,36 @@ func decryptFileHandlerByGet(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	// 获取文件信息
-	fileInfo, err := file.Stat()
+	// 读取文件内容
+	fileData, err := io.ReadAll(file)
+	// 识别文件类型
+	kind, err := filetype.Match(fileData)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	// 创建一个缓冲区，大小为文件的长度
-	fileData := make([]byte, fileInfo.Size())
-	// 读取文件内容到缓冲区
-	_, err = file.Read(fileData)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+	// 如果识别到文件类型
+	if kind != filetype.Unknown {
+		// 获取 MIME 类型
+		mimeType := kind.MIME.Value
+		// 设置响应头，指定Content-Type为二进制流
+		c.Header("Content-Type", mimeType)
+		// 将文件内容作为二进制流发送给浏览器
+		c.Data(http.StatusOK, mimeType, fileData)
+	} else {
+		// 未能识别文件类型
+		c.AbortWithStatus(http.StatusInternalServerError)
 	}
+}
 
-	// 设置响应头，指定Content-Type为二进制流
-	c.Header("Content-Type", "application/octet-stream")
-	// 将文件内容作为二进制流发送给浏览器
-	_, err = c.Writer.Write(fileData)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+func main() {
+	loadConfig()
+	router := gin.Default()
+
+	// 设置路由
+	router.POST("/encrypt", encryptFileHandler)
+	router.POST("/post-decrypt", decryptFileHandlerByPost)
+	router.GET("/get-decrypt", decryptFileHandlerByGet)
+	// 启动服务器
+	router.Run(":8888")
 }
