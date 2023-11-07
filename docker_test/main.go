@@ -153,7 +153,7 @@ func decryptFileHandlerByGet(c *gin.Context) {
 	// 从请求参数中获取加密后文件地址
 	encryptedFilePath := c.Query("encryptedFilePath")
 	//从请求参数中获取原始文件名+类型
-	decryptedFileName := c.Query("decryptedFileName")
+	decryptedFileName := fmt.Sprintf("file_%d", rand.Intn(1000000))
 	//打开加密文件
 	encryptedFile, err := os.Open(encryptedFilePath)
 	if err != nil {
