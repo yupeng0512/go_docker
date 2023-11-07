@@ -16,7 +16,27 @@ import (
 	"os"
 )
 
-// 对称加密密钥，注意保密性
+var fileMap = map[string]string{
+	"application/msword": ".doc",
+	"application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+	"application/vnd.ms-excel": "xls",
+	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":         ".xlsx",
+	"application/vnd.ms-powerpoint":                                             ".ppt",
+	"application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+	"application/pdf":   ".pdf",
+	"application/rtf":   ".rtf",
+	"image/gif":         ".gif",
+	"image/png":         ".png",
+	"image/tiff":        ".tif",
+	"image/bmp":         ".bmp",
+	"image/svg+xml":     ".svg",
+	"image/webp":        ".webp",
+	"image/x-icon":      ".ico",
+	"application/kswps": ".wps",
+	"text/plain":        ".txt",
+}
+
+// 对称加密密钥
 var key []byte
 
 // 加载配置文件
@@ -152,7 +172,7 @@ func decryptFileHandlerByPost(c *gin.Context) {
 func decryptFileHandlerByGet(c *gin.Context) {
 	// 从请求参数中获取加密后文件地址
 	encryptedFilePath := c.Query("encryptedFilePath")
-	//从请求参数中获取原始文件名+类型
+	//随机原始文件名
 	decryptedFileName := fmt.Sprintf("file_%d", rand.Intn(1000000))
 	//打开加密文件
 	encryptedFile, err := os.Open(encryptedFilePath)
@@ -209,6 +229,12 @@ func decryptFileHandlerByGet(c *gin.Context) {
 		if kind != types.Unknown {
 			mimeType = kind.MIME.Value
 		}
+	}
+	//更新文件名
+	err = os.Rename(filePath+decryptedFileName, filePath+decryptedFileName+fileMap[mimeType])
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
 	// 设置响应头，指定Content-Type为二进制流
 	c.Header("Content-Type", mimeType)
