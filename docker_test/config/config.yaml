@@ -1,4 +1,5 @@
 # config.yaml
 encryption:
-  # Runtime secrets must be supplied through ENCRYPTION_KEY.
+  # ENCRYPTION_KEY is standard Base64 encoding of exactly 32 random bytes.
+  # Runtime secrets must be supplied by the process environment or secret store.
   key: ""

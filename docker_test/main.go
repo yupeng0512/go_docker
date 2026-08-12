@@ -1,253 +1,347 @@
 package main
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	cryptorand "crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
 	"fmt"
-	"github.com/gabriel-vasile/mimetype"
-	"github.com/gin-gonic/gin"
-	"github.com/h2non/filetype"
-	"github.com/h2non/filetype/types"
 	"io"
-	"math/rand"
-	"mime/multipart"
 	"net/http"
 	"os"
+	"path/filepath"
+	"regexp"
+
+	"github.com/gin-gonic/gin"
 )
 
-var fileMap = map[string]string{
-	"application/msword": ".doc",
-	"application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-	"application/vnd.ms-excel": "xls",
-	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":         ".xlsx",
-	"application/vnd.ms-powerpoint":                                             ".ppt",
-	"application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
-	"application/pdf":   ".pdf",
-	"application/rtf":   ".rtf",
-	"image/gif":         ".gif",
-	"image/png":         ".png",
-	"image/tiff":        ".tif",
-	"image/bmp":         ".bmp",
-	"image/svg+xml":     ".svg",
-	"image/webp":        ".webp",
-	"image/x-icon":      ".ico",
-	"application/kswps": ".wps",
-	"text/plain":        ".txt",
-}
+const (
+	encryptionKeyBytes = 32
+	maxPayloadBytes    = 32 << 20
+	managedTokenBytes  = 16
+	maxEnvelopeBytes   = maxPayloadBytes + 64
+	maxMultipartBytes  = maxEnvelopeBytes + 64<<10
+	maxTokenFormBytes  = 1024
+	defaultListenAddr  = "127.0.0.1:8888"
+)
 
-// 对称加密密钥
-var key []byte
+var (
+	envelopeMagic    = []byte("GDK1")
+	managedTokenRE   = regexp.MustCompile(`^[0-9a-f]{32}\.gdk$`)
+	encryptedFileDir = "./attachment/encrypt_file"
+	key              []byte
+)
 
-// loadConfig 从运行环境加载密钥，避免把可用密钥提交进 Git。
+// loadConfig loads an AES-256 key from canonical Base64 without changing the
+// active key when validation fails.
 func loadConfig() error {
-	keyString := os.Getenv("ENCRYPTION_KEY")
-	switch len(keyString) {
-	case aes.BlockSize:
-		key = []byte(keyString)
-		return nil
-	default:
-		return fmt.Errorf("ENCRYPTION_KEY must contain exactly %d bytes", aes.BlockSize)
+	encoded := os.Getenv("ENCRYPTION_KEY")
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil || len(decoded) != encryptionKeyBytes || base64.StdEncoding.EncodeToString(decoded) != encoded {
+		return fmt.Errorf(
+			"ENCRYPTION_KEY must be standard Base64 encoding of exactly %d bytes",
+			encryptionKeyBytes,
+		)
 	}
+	key = append([]byte(nil), decoded...)
+	return nil
 }
 
-// 传入原始文件对称加密，返回文件地址的路由处理函数
+// encryptPayload returns a versioned AES-GCM envelope. The magic bytes are
+// authenticated as additional data so an attacker cannot downgrade formats.
+func encryptPayload(encryptionKey, plaintext []byte) ([]byte, error) {
+	gcm, err := newGCM(encryptionKey)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(cryptorand.Reader, nonce); err != nil {
+		return nil, fmt.Errorf("generate nonce: %w", err)
+	}
+	envelope := make([]byte, 0, len(envelopeMagic)+len(nonce)+len(plaintext)+gcm.Overhead())
+	envelope = append(envelope, envelopeMagic...)
+	envelope = append(envelope, nonce...)
+	envelope = gcm.Seal(envelope, nonce, plaintext, envelopeMagic)
+	return envelope, nil
+}
+
+func decryptPayload(encryptionKey, envelope []byte) ([]byte, error) {
+	gcm, err := newGCM(encryptionKey)
+	if err != nil {
+		return nil, err
+	}
+	headerSize := len(envelopeMagic) + gcm.NonceSize()
+	if len(envelope) < headerSize+gcm.Overhead() || !bytes.Equal(envelope[:len(envelopeMagic)], envelopeMagic) {
+		return nil, errors.New("unsupported or truncated encrypted envelope")
+	}
+	nonce := envelope[len(envelopeMagic):headerSize]
+	ciphertext := envelope[headerSize:]
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, envelopeMagic)
+	if err != nil {
+		return nil, errors.New("encrypted envelope authentication failed")
+	}
+	return plaintext, nil
+}
+
+func newGCM(encryptionKey []byte) (cipher.AEAD, error) {
+	if len(encryptionKey) != encryptionKeyBytes {
+		return nil, fmt.Errorf("encryption key must contain exactly %d bytes", encryptionKeyBytes)
+	}
+	block, err := aes.NewCipher(encryptionKey)
+	if err != nil {
+		return nil, fmt.Errorf("initialize AES: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("initialize GCM: %w", err)
+	}
+	return gcm, nil
+}
+
+func readBounded(reader io.Reader, limit int64) ([]byte, error) {
+	payload, err := io.ReadAll(io.LimitReader(reader, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(payload)) > limit {
+		return nil, fmt.Errorf("payload exceeds %d-byte limit", limit)
+	}
+	return payload, nil
+}
+
+func randomManagedToken() (string, error) {
+	raw := make([]byte, managedTokenBytes)
+	if _, err := io.ReadFull(cryptorand.Reader, raw); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw) + ".gdk", nil
+}
+
+func persistCiphertext(envelope []byte) (string, error) {
+	if err := ensurePrivateCiphertextDirectory(); err != nil {
+		return "", err
+	}
+	for attempts := 0; attempts < 3; attempts++ {
+		token, err := randomManagedToken()
+		if err != nil {
+			return "", err
+		}
+		path := filepath.Join(encryptedFileDir, token)
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		committed := false
+		defer func() {
+			_ = file.Close()
+			if !committed {
+				_ = os.Remove(path)
+			}
+		}()
+		if _, err := file.Write(envelope); err != nil {
+			return "", err
+		}
+		if err := file.Sync(); err != nil {
+			return "", err
+		}
+		if err := file.Close(); err != nil {
+			return "", err
+		}
+		committed = true
+		return token, nil
+	}
+	return "", errors.New("could not allocate a unique encrypted file token")
+}
+
+func ensurePrivateCiphertextDirectory() error {
+	info, err := os.Lstat(encryptedFileDir)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.MkdirAll(encryptedFileDir, 0o700); err != nil {
+			return err
+		}
+		info, err = os.Lstat(encryptedFileDir)
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("encrypted file directory must be a real directory")
+	}
+	return os.Chmod(encryptedFileDir, 0o700)
+}
+
+func verifyCiphertextDirectory() error {
+	info, err := os.Lstat(encryptedFileDir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("encrypted file directory must be a real directory")
+	}
+	return nil
+}
+
+func readManagedCiphertext(token string) ([]byte, error) {
+	if !managedTokenRE.MatchString(token) {
+		return nil, errors.New("invalid encrypted file token")
+	}
+	if err := verifyCiphertextDirectory(); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(encryptedFileDir, token)
+	before, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 || before.Size() > maxEnvelopeBytes {
+		return nil, errors.New("encrypted file is not a bounded regular file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	after, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !after.Mode().IsRegular() || !os.SameFile(before, after) {
+		return nil, errors.New("encrypted file changed during open")
+	}
+	return readBounded(file, maxEnvelopeBytes)
+}
+
+func readMultipartFile(request *http.Request, fieldName string, limit int64) ([]byte, error) {
+	reader, err := request.MultipartReader()
+	if err != nil {
+		return nil, err
+	}
+	var payload []byte
+	found := false
+	for {
+		part, err := reader.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if part.FormName() != fieldName || part.FileName() == "" {
+			_ = part.Close()
+			continue
+		}
+		if found {
+			_ = part.Close()
+			return nil, errors.New("duplicate uploaded file")
+		}
+		payload, err = readBounded(part, limit)
+		_ = part.Close()
+		if err != nil {
+			return nil, err
+		}
+		found = true
+	}
+	if !found {
+		return nil, errors.New("missing uploaded file")
+	}
+	return payload, nil
+}
+
 func encryptFileHandler(c *gin.Context) {
-	file, err := c.FormFile("file")
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxMultipartBytes)
+	plaintext, err := readMultipartFile(c.Request, "file", maxPayloadBytes)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid file payload"})
 		return
 	}
-	//打开原始文件
-	srcFile, err := file.Open()
+	envelope, err := encryptPayload(key, plaintext)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "encryption failed"})
 		return
 	}
-	defer func(srcFile multipart.File) {
-		err := srcFile.Close()
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-	}(srcFile)
-
-	// 创建加密后的文件
-	filePath := "./attachment/encrypt_file/"
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		err = os.MkdirAll(filePath, os.ModePerm)
-	}
-	encryptedFilePath := filePath + fmt.Sprintf("file_%d", rand.Intn(1000000))
-	encryptedFile, err := os.Create(encryptedFilePath)
+	token, err := persistCiphertext(envelope)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "encrypted file storage failed"})
 		return
 	}
-	defer func(encryptedFile *os.File) {
-		err := encryptedFile.Close()
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-	}(encryptedFile)
-
-	// 创建加密器
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	stream := cipher.NewCFBEncrypter(block, key)
-
-	// 加密并写入加密文件
-	writer := &cipher.StreamWriter{S: stream, W: encryptedFile}
-	if _, err := io.Copy(writer, srcFile); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"encryptedFile": encryptedFilePath})
+	c.JSON(http.StatusOK, gin.H{"encryptedFile": token})
 }
 
-// 传入加密后文件，解密后向浏览器输出原始格式的二进制流的路由处理函数
 func decryptFileHandlerByPost(c *gin.Context) {
-	file, _ := c.FormFile("encryptedFile")
-
-	// 打开加密文件
-	encryptedFile, err := file.Open()
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxMultipartBytes)
+	envelope, err := readMultipartFile(c.Request, "encryptedFile", maxEnvelopeBytes)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid encrypted payload"})
 		return
 	}
-	defer func(encryptedFile multipart.File) {
-		err := encryptedFile.Close()
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-	}(encryptedFile)
-
-	// 创建解密器
-	block, err := aes.NewCipher(key)
+	plaintext, err := decryptPayload(key, envelope)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "encrypted payload rejected"})
 		return
 	}
-	stream := cipher.NewCFBDecrypter(block, key)
-
-	// 创建解密后的文件
-	filePath := "./attachment/decrypt_file/"
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		err = os.MkdirAll(filePath, os.ModePerm)
-	}
-	decryptedFile, err := os.Create(filePath + file.Filename)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	defer func(decryptedFile *os.File) {
-		err := decryptedFile.Close()
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-	}(decryptedFile)
-
-	// 解密并写入解密文件
-	reader := &cipher.StreamReader{S: stream, R: encryptedFile}
-	if _, err := io.Copy(decryptedFile, reader); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	// 设置响应头，指定Content-Type为二进制流
-	c.Header("Content-Type", "application/octet-stream")
-	c.File("./attachment/decrypt_file/" + file.Filename)
+	writeDownload(c, plaintext)
 }
 
-// 传入加密后文件地址和原始文件名，解密后向浏览器输出原始格式的二进制流的路由处理函数
-func decryptFileHandlerByGet(c *gin.Context) {
-	// 从请求参数中获取加密后文件地址
-	encryptedFilePath := c.Query("encryptedFilePath")
-	//随机原始文件名
-	decryptedFileName := fmt.Sprintf("file_%d", rand.Intn(1000000))
-	//打开加密文件
-	encryptedFile, err := os.Open(encryptedFilePath)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+func decryptStoredFileHandler(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxTokenFormBytes)
+	if err := c.Request.ParseForm(); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid encrypted file request"})
 		return
 	}
-	// 创建解密器
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	tokens := c.Request.PostForm["encryptedFile"]
+	if len(tokens) != 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "exactly one encrypted file token is required"})
 		return
 	}
-	stream := cipher.NewCFBDecrypter(block, key)
-
-	// 创建解密后的文件
-	filePath := "./attachment/decrypt_file/"
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		err = os.MkdirAll(filePath, os.ModePerm)
-	}
-	decryptedFile, err := os.Create(filePath + decryptedFileName)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	token := tokens[0]
+	if !managedTokenRE.MatchString(token) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid encrypted file token"})
 		return
 	}
-	defer func(decryptedFile *os.File) {
-		err := decryptedFile.Close()
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	envelope, err := readManagedCiphertext(token)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "encrypted file not found"})
 			return
 		}
-	}(decryptedFile)
-
-	// 解密并写入解密文件
-	reader := &cipher.StreamReader{S: stream, R: encryptedFile}
-	if _, err := io.Copy(decryptedFile, reader); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "encrypted file read failed"})
 		return
 	}
-
-	// 打开文件
-	file, err := os.Open(filePath + decryptedFileName)
+	plaintext, err := decryptPayload(key, envelope)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "encrypted payload rejected"})
 		return
 	}
-	// 读取文件内容
-	fileData, err := io.ReadAll(file)
-	// 使用 mimetype 库来获取文件的 MIME 类型
-	mimeType := mimetype.Detect(fileData).String()
-	// 如果 mimetype 未能准确识别文件类型，则使用 filetype 库来进一步识别
-	if mimeType == "application/octet-stream" || mimeType == "application/x-dosexec" || mimeType == "application/zip" {
-		kind, _ := filetype.Match(fileData)
-		if kind != types.Unknown {
-			mimeType = kind.MIME.Value
-		}
-	}
-	//更新文件名
-	err = os.Rename(filePath+decryptedFileName, filePath+decryptedFileName+fileMap[mimeType])
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	// 设置响应头，指定Content-Type为二进制流
-	c.Header("Content-Type", mimeType)
-	// 将文件内容作为二进制流发送给浏览器
-	c.Data(http.StatusOK, mimeType, fileData)
+	writeDownload(c, plaintext)
+}
+
+func writeDownload(c *gin.Context, plaintext []byte) {
+	c.Header("Cache-Control", "no-store")
+	c.Header("Content-Disposition", `attachment; filename="decrypted.bin"`)
+	c.Header("Pragma", "no-cache")
+	c.Header("X-Content-Type-Options", "nosniff")
+	c.Data(http.StatusOK, "application/octet-stream", plaintext)
+}
+
+func newRouter() *gin.Engine {
+	router := gin.Default()
+	router.POST("/encrypt", encryptFileHandler)
+	router.POST("/post-decrypt", decryptFileHandlerByPost)
+	router.POST("/stored-decrypt", decryptStoredFileHandler)
+	return router
 }
 
 func main() {
 	if err := loadConfig(); err != nil {
 		panic(err)
 	}
-	router := gin.Default()
-
-	// 设置路由
-	router.POST("/encrypt", encryptFileHandler)
-	router.POST("/post-decrypt", decryptFileHandlerByPost)
-	router.GET("/get-decrypt", decryptFileHandlerByGet)
-	// 启动服务器
-	router.Run(":8888")
+	if err := newRouter().Run(defaultListenAddr); err != nil {
+		panic(err)
+	}
 }
