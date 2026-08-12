@@ -1,3 +1,4 @@
 # config.yaml
 encryption:
-  key: "123456789abcdefg"
+  # Runtime secrets must be supplied through ENCRYPTION_KEY.
+  key: ""

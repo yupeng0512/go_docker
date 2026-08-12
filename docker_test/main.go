@@ -8,7 +8,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/h2non/filetype"
 	"github.com/h2non/filetype/types"
-	"github.com/spf13/viper"
 	"io"
 	"math/rand"
 	"mime/multipart"
@@ -39,19 +38,16 @@ var fileMap = map[string]string{
 // 对称加密密钥
 var key []byte
 
-// 加载配置文件
-func loadConfig() {
-	viper.SetConfigName("config")   // 配置文件名（无文件扩展名）
-	viper.AddConfigPath("./config") // 配置文件路径，此处为当前目录
-
-	err := viper.ReadInConfig()
-	if err != nil {
-		panic(fmt.Errorf("failed to read config file: %s", err))
+// loadConfig 从运行环境加载密钥，避免把可用密钥提交进 Git。
+func loadConfig() error {
+	keyString := os.Getenv("ENCRYPTION_KEY")
+	switch len(keyString) {
+	case aes.BlockSize:
+		key = []byte(keyString)
+		return nil
+	default:
+		return fmt.Errorf("ENCRYPTION_KEY must contain exactly %d bytes", aes.BlockSize)
 	}
-
-	// 从配置文件中读取密钥
-	keyString := viper.GetString("encryption.key")
-	key = []byte(keyString)
 }
 
 // 传入原始文件对称加密，返回文件地址的路由处理函数
@@ -243,7 +239,9 @@ func decryptFileHandlerByGet(c *gin.Context) {
 }
 
 func main() {
-	loadConfig()
+	if err := loadConfig(); err != nil {
+		panic(err)
+	}
 	router := gin.Default()
 
 	// 设置路由
